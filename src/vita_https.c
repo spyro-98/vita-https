@@ -6,6 +6,10 @@
 #include <string.h>
 
 #include <curl/curl.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/x509_crt.h>
 
 #include "ca_bundle.h"
 #include "net_runtime.h"
@@ -20,6 +24,8 @@ struct VitaHttpsClient {
 	long request_timeout_ms;
 	long low_speed_limit;
 	long low_speed_time;
+	char pinned_public_key[128];
+	int allow_untrusted_ca_with_pin;
 };
 
 typedef struct RangeStream {
@@ -47,6 +53,11 @@ typedef struct FixedBuffer {
 static int s_init_count;
 
 static int curl_error(CURLcode code) {
+	if (code == CURLE_PEER_FAILED_VERIFICATION ||
+	    code == CURLE_SSL_CACERT_BADFILE)
+		return VITA_HTTPS_ERROR_UNTRUSTED_CERTIFICATE;
+	if (code == CURLE_SSL_PINNEDPUBKEYNOTMATCH)
+		return VITA_HTTPS_ERROR_PIN_MISMATCH;
 	return VITA_HTTPS_ERROR_CURL_BASE - (int)code;
 }
 
@@ -103,10 +114,16 @@ static void apply_common(CURL *curl, const VitaHttpsClient *client,
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, client->request_timeout_ms);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, client->low_speed_limit);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, client->low_speed_time);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+	int pinned_self_signed = client->allow_untrusted_ca_with_pin &&
+	                         client->pinned_public_key[0];
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,
+	                 pinned_self_signed ? 0L : 1L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 	curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
 	curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &ca);
+	if (client->pinned_public_key[0])
+		curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY,
+		                 client->pinned_public_key);
 	if (client->username[0]) {
 		curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
 		curl_easy_setopt(curl, CURLOPT_USERNAME, client->username);
@@ -161,6 +178,13 @@ VitaHttpsClient *vita_https_client_create(const VitaHttpsClientConfig *config) {
 		snprintf(client->username, sizeof(client->username), "%s", config->username);
 	if (config && config->password)
 		snprintf(client->password, sizeof(client->password), "%s", config->password);
+	if (config && config->pinned_public_key)
+		snprintf(client->pinned_public_key,
+		         sizeof(client->pinned_public_key), "%s",
+		         config->pinned_public_key);
+	client->allow_untrusted_ca_with_pin =
+		config && config->allow_untrusted_ca_with_pin &&
+		client->pinned_public_key[0];
 	client->connect_timeout_ms = config && config->connect_timeout_ms > 0
 	                           ? config->connect_timeout_ms : 10000;
 	client->request_timeout_ms = config && config->request_timeout_ms > 0
@@ -176,6 +200,78 @@ void vita_https_client_destroy(VitaHttpsClient *client) {
 	if (!client) return;
 	memset(client->password, 0, sizeof(client->password));
 	free(client);
+}
+
+static int public_key_pin_from_pem(const char *pem, char *pin,
+	                               size_t pin_size) {
+	if (!pem || !pin || pin_size < 53) return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
+	mbedtls_x509_crt certificate;
+	mbedtls_x509_crt_init(&certificate);
+	int result = mbedtls_x509_crt_parse(&certificate,
+		                              (const unsigned char *)pem,
+		                              strlen(pem) + 1);
+	if (result < 0) {
+		mbedtls_x509_crt_free(&certificate);
+		return VITA_HTTPS_ERROR_CERTIFICATE_INFO;
+	}
+	unsigned char der[2048];
+	int der_size = mbedtls_pk_write_pubkey_der(&certificate.pk, der, sizeof(der));
+	if (der_size <= 0 || (size_t)der_size > sizeof(der)) {
+		mbedtls_x509_crt_free(&certificate);
+		return VITA_HTTPS_ERROR_CERTIFICATE_INFO;
+	}
+	unsigned char digest[32];
+	result = mbedtls_sha256(der + sizeof(der) - (size_t)der_size,
+	                        (size_t)der_size, digest, 0);
+	mbedtls_x509_crt_free(&certificate);
+	if (result < 0) return VITA_HTTPS_ERROR_CERTIFICATE_INFO;
+	unsigned char encoded[48];
+	size_t encoded_size = 0;
+	result = mbedtls_base64_encode(encoded, sizeof(encoded), &encoded_size,
+	                               digest, sizeof(digest));
+	if (result < 0 || encoded_size != 44 || pin_size < 9 + encoded_size)
+		return VITA_HTTPS_ERROR_CERTIFICATE_INFO;
+	memcpy(pin, "sha256//", 8);
+	memcpy(pin + 8, encoded, encoded_size);
+	pin[8 + encoded_size] = '\0';
+	return 0;
+}
+
+int vita_https_probe_public_key(VitaHttpsClient *client, const char *url,
+	                            char *pin, size_t pin_size) {
+	if (s_init_count <= 0) return VITA_HTTPS_ERROR_NOT_INITIALIZED;
+	if (!client || !valid_https_url(url) || !pin || pin_size < 53)
+		return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
+	pin[0] = '\0';
+	CURL *curl = curl_easy_init();
+	if (!curl) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
+	apply_common(curl, client, NULL);
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, NULL);
+	curl_easy_setopt(curl, CURLOPT_CERTINFO, 1L);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_write);
+	CURLcode code = curl_easy_perform(curl);
+	int result = code == CURLE_OK ? VITA_HTTPS_ERROR_CERTIFICATE_INFO
+	                             : curl_error(code);
+	if (code == CURLE_OK) {
+		struct curl_certinfo *info = NULL;
+		if (curl_easy_getinfo(curl, CURLINFO_CERTINFO, &info) == CURLE_OK &&
+		    info && info->num_of_certs > 0) {
+			for (struct curl_slist *item = info->certinfo[0]; item;
+			     item = item->next) {
+				if (item->data && strncmp(item->data, "Cert:", 5) == 0) {
+					result = public_key_pin_from_pem(item->data + 5,
+					                                 pin, pin_size);
+					break;
+				}
+			}
+		}
+	}
+	curl_easy_cleanup(curl);
+	return result;
 }
 
 int vita_https_perform(VitaHttpsClient *client,
@@ -387,6 +483,9 @@ const char *vita_https_error_string(int error) {
 	case VITA_HTTPS_ERROR_OUT_OF_MEMORY: return "out of memory";
 	case VITA_HTTPS_ERROR_HTTP_STATUS: return "HTTP request failed";
 	case VITA_HTTPS_ERROR_RANGE_UNSUPPORTED: return "verified byte ranges are unavailable";
+	case VITA_HTTPS_ERROR_UNTRUSTED_CERTIFICATE: return "TLS certificate is not trusted";
+	case VITA_HTTPS_ERROR_PIN_MISMATCH: return "TLS public-key pin mismatch";
+	case VITA_HTTPS_ERROR_CERTIFICATE_INFO: return "TLS public-key fingerprint unavailable";
 	default: return "Vita network initialization failed";
 	}
 }

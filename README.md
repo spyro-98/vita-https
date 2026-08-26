@@ -6,7 +6,7 @@ bundle, authenticated requests and cached seekable Range streams.
 Connectivity and Wi-Fi signal queries are guarded by the same lifecycle, so
 UI code never calls an unloaded sceNetCtl stub.
 
-It is the extracted transport used by VitaTube. The protocol is not a custom
+It is the extracted transport used by VitaWave. The protocol is not a custom
 TLS implementation: TLS and certificate validation are provided by Mbed TLS;
 this package owns the Vita lifecycle, policy and stream abstraction around it.
 
@@ -47,12 +47,20 @@ decoder packages' stream handle.
 
 - only `https://` input and redirect URLs are accepted;
 - TLS 1.2 is the minimum negotiated protocol version;
-- peer and hostname verification are always enabled;
+- peer and hostname verification are enabled by default;
 - a bundled Mozilla CA store is supplied explicitly;
 - credentials are never placed in URLs;
 - redirects, timeouts, low-speed aborts and cooperative cancellation are
   bounded by the package;
-- no public switch exists to disable TLS verification.
+- private or self-signed peers require an exact `sha256//` SPKI pin on every
+  request; there is no mode that disables CA verification without a pin.
+
+`vita_https_probe_public_key` performs an unauthenticated, bodyless handshake
+solely to obtain the leaf public-key pin for an explicit trust-on-first-use UI.
+Do not use the probe result for application data until the user has compared
+and confirmed it. A client configured with that confirmed pin may set
+`allow_untrusted_ca_with_pin`; the exact public key then replaces public-CA and
+hostname trust for that private endpoint, and any later key change fails closed.
 
 The client must outlive every Range stream created from it. Call init/shutdown
 symmetrically; the global lifecycle is reference-counted.

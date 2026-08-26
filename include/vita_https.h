@@ -16,6 +16,9 @@ enum {
 	VITA_HTTPS_ERROR_OUT_OF_MEMORY = -3,
 	VITA_HTTPS_ERROR_HTTP_STATUS = -4,
 	VITA_HTTPS_ERROR_RANGE_UNSUPPORTED = -5,
+	VITA_HTTPS_ERROR_UNTRUSTED_CERTIFICATE = -6,
+	VITA_HTTPS_ERROR_PIN_MISMATCH = -7,
+	VITA_HTTPS_ERROR_CERTIFICATE_INFO = -8,
 	VITA_HTTPS_ERROR_CURL_BASE = -1000
 };
 
@@ -27,6 +30,10 @@ typedef struct VitaHttpsClientConfig {
 	long request_timeout_ms;
 	long low_speed_bytes_per_second;
 	long low_speed_seconds;
+	/* Optional libcurl sha256// SPKI pin. CA verification remains enabled
+	 * unless allow_untrusted_ca_with_pin is also set. */
+	const char *pinned_public_key;
+	int allow_untrusted_ca_with_pin;
 } VitaHttpsClientConfig;
 
 typedef size_t (*VitaHttpsWriteCallback)(const void *data, size_t size,
@@ -68,8 +75,16 @@ int vita_https_wifi_signal_percent(int *percent);
 VitaHttpsClient *vita_https_client_create(const VitaHttpsClientConfig *config);
 void vita_https_client_destroy(VitaHttpsClient *client);
 
-/* Only https:// URLs are accepted. Certificate and host verification cannot
- * be disabled through this API and redirects are restricted to HTTPS. */
+/* Retrieves the server's leaf public-key pin for an explicit trust-on-first-use
+ * confirmation UI. This probe does not authenticate the peer and must never be
+ * used for application data. A confirmed value can be supplied in the client
+ * config so every subsequent request is cryptographically pinned. */
+int vita_https_probe_public_key(VitaHttpsClient *client, const char *url,
+	                            char *pin, size_t pin_size);
+
+/* Only https:// URLs are accepted and redirects are restricted to HTTPS.
+ * CA and host verification are mandatory by default. An explicitly confirmed
+ * public-key pin may replace CA verification for a private/self-signed server. */
 int vita_https_perform(VitaHttpsClient *client,
 	                   const VitaHttpsRequest *request,
 	                   VitaHttpsResponse *response);
