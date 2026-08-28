@@ -6,7 +6,7 @@ bundle, authenticated requests and cached seekable Range streams.
 Connectivity and Wi-Fi signal queries are guarded by the same lifecycle, so
 UI code never calls an unloaded sceNetCtl stub.
 
-It is the extracted transport used by VitaWave. The protocol is not a custom
+It is the extracted transport used by VitaMediaDeck. The protocol is not a custom
 TLS implementation: TLS and certificate validation are provided by Mbed TLS;
 this package owns the Vita lifecycle, policy and stream abstraction around it.
 
