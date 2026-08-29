@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <curl/curl.h>
 #include <mbedtls/base64.h>
@@ -30,6 +31,7 @@ struct VitaHttpsClient {
 
 typedef struct RangeStream {
 	VitaHttpsClient *client;
+	CURL *curl;
 	char *url;
 	volatile int *cancel;
 	uint64_t size;
@@ -37,6 +39,10 @@ typedef struct RangeStream {
 	uint64_t cache_start;
 	size_t cache_size;
 	unsigned char *cache;
+	uint64_t response_range_start;
+	uint64_t response_range_end;
+	uint64_t response_range_total;
+	int response_range_valid;
 } RangeStream;
 
 typedef struct WriteBridge {
@@ -84,6 +90,27 @@ static size_t fixed_write(char *data, size_t size, size_t count, void *opaque) {
 	if (!buffer || bytes > buffer->capacity - buffer->size) return 0;
 	memcpy(buffer->data + buffer->size, data, bytes);
 	buffer->size += bytes;
+	return bytes;
+}
+
+static size_t range_header(char *data, size_t size, size_t count, void *opaque) {
+	RangeStream *stream = (RangeStream *)opaque;
+	if (size && count > SIZE_MAX / size) return 0;
+	size_t bytes = size * count;
+	if (!stream || bytes < 14 || strncasecmp(data, "Content-Range:", 14) != 0)
+		return bytes;
+	char line[160];
+	size_t copied = bytes < sizeof(line) - 1 ? bytes : sizeof(line) - 1;
+	memcpy(line, data, copied);
+	line[copied] = '\0';
+	unsigned long long first = 0, last = 0, total = 0;
+	if (sscanf(line + 14, " bytes %llu-%llu/%llu", &first, &last, &total) == 3 &&
+	    first <= last && last < total && total <= (unsigned long long)INT64_MAX) {
+		stream->response_range_start = (uint64_t)first;
+		stream->response_range_end = (uint64_t)last;
+		stream->response_range_total = (uint64_t)total;
+		stream->response_range_valid = 1;
+	}
 	return bytes;
 }
 
@@ -351,25 +378,32 @@ void vita_https_free(void *pointer) {
 
 static int range_fetch(RangeStream *stream, uint64_t start) {
 	if (!stream || start >= stream->size) return 0;
-	uint64_t end = start + RANGE_CACHE_SIZE - 1;
-	if (end >= stream->size) end = stream->size - 1;
+	uint64_t remaining = stream->size - start;
+	uint64_t wanted = remaining < RANGE_CACHE_SIZE ? remaining : RANGE_CACHE_SIZE;
+	uint64_t end = start + wanted - 1;
 	char range[64];
 	snprintf(range, sizeof(range), "%llu-%llu",
 	         (unsigned long long)start, (unsigned long long)end);
-	CURL *curl = curl_easy_init();
-	if (!curl) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
-	apply_common(curl, stream->client, stream->cancel);
-	curl_easy_setopt(curl, CURLOPT_URL, stream->url);
-	curl_easy_setopt(curl, CURLOPT_RANGE, range);
+	if (!stream->curl) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
+	stream->response_range_valid = 0;
+	/* The transfer writes directly into the cache. Invalidate the previous window
+	 * before the first byte so a cancelled/short refill can never expose a mixture
+	 * of old metadata and partially replaced media bytes on a later retry. */
+	stream->cache_size = 0;
+	curl_easy_setopt(stream->curl, CURLOPT_RANGE, range);
 	FixedBuffer buffer = { stream->cache, 0, RANGE_CACHE_SIZE };
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fixed_write);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-	CURLcode code = curl_easy_perform(curl);
+	curl_easy_setopt(stream->curl, CURLOPT_WRITEFUNCTION, fixed_write);
+	curl_easy_setopt(stream->curl, CURLOPT_WRITEDATA, &buffer);
+	CURLcode code = curl_easy_perform(stream->curl);
 	long status = 0;
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-	curl_easy_cleanup(curl);
+	curl_easy_getinfo(stream->curl, CURLINFO_RESPONSE_CODE, &status);
 	if (code != CURLE_OK) return curl_error(code);
-	if (status != 206) return VITA_HTTPS_ERROR_RANGE_UNSUPPORTED;
+	if (status != 206 || !stream->response_range_valid ||
+	    stream->response_range_start != start ||
+	    stream->response_range_end != end ||
+	    stream->response_range_total != stream->size ||
+	    buffer.size != (size_t)wanted)
+		return VITA_HTTPS_ERROR_RANGE_UNSUPPORTED;
 	stream->cache_start = start;
 	stream->cache_size = buffer.size;
 	return buffer.size > 0 ? 0 : VITA_HTTPS_ERROR_RANGE_UNSUPPORTED;
@@ -414,6 +448,7 @@ static int64_t range_seek(void *opaque, int64_t offset, int origin) {
 static void range_close(void *opaque) {
 	RangeStream *stream = (RangeStream *)opaque;
 	if (!stream) return;
+	curl_easy_cleanup(stream->curl);
 	free(stream->cache);
 	free(stream->url);
 	free(stream);
@@ -425,41 +460,40 @@ int vita_https_open_range_stream(VitaHttpsClient *client, const char *url,
 	if (!client || !out || !valid_https_url(url))
 		return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
-	VitaHttpsResponse head = {0};
-	VitaHttpsRequest request = {
-		.method = "HEAD", .url = url, .cancel_flag = cancel_flag
-	};
-	int result = vita_https_perform(client, &request, &head);
-	if (result < 0) return result;
-	if (head.content_length <= 0) return VITA_HTTPS_ERROR_RANGE_UNSUPPORTED;
 	RangeStream *stream = calloc(1, sizeof(*stream));
 	if (!stream) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
 	stream->url = strdup(url);
 	stream->cache = malloc(RANGE_CACHE_SIZE);
-	if (!stream->url || !stream->cache) {
+	stream->curl = curl_easy_init();
+	if (!stream->url || !stream->cache || !stream->curl) {
 		range_close(stream);
 		return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
 	}
 	stream->client = client;
 	stream->cancel = cancel_flag;
-	stream->size = (uint64_t)head.content_length;
-	CURL *curl = curl_easy_init();
-	if (!curl) result = VITA_HTTPS_ERROR_OUT_OF_MEMORY;
-	else {
-		apply_common(curl, client, cancel_flag);
-		curl_easy_setopt(curl, CURLOPT_URL, url);
-		curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
-		FixedBuffer probe = { stream->cache, 0, 1 };
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fixed_write);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &probe);
-		CURLcode code = curl_easy_perform(curl);
-		long status = 0;
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-		curl_easy_cleanup(curl);
-		result = code == CURLE_OK && status == 206 && probe.size == 1
-		       ? 0 : VITA_HTTPS_ERROR_RANGE_UNSUPPORTED;
+	apply_common(stream->curl, client, cancel_flag);
+	curl_easy_setopt(stream->curl, CURLOPT_URL, stream->url);
+	curl_easy_setopt(stream->curl, CURLOPT_HEADERFUNCTION, range_header);
+	curl_easy_setopt(stream->curl, CURLOPT_HEADERDATA, stream);
+	char range[64];
+	snprintf(range, sizeof(range), "0-%u", (unsigned)(RANGE_CACHE_SIZE - 1));
+	curl_easy_setopt(stream->curl, CURLOPT_RANGE, range);
+	FixedBuffer probe = { stream->cache, 0, RANGE_CACHE_SIZE };
+	curl_easy_setopt(stream->curl, CURLOPT_WRITEFUNCTION, fixed_write);
+	curl_easy_setopt(stream->curl, CURLOPT_WRITEDATA, &probe);
+	CURLcode code = curl_easy_perform(stream->curl);
+	long status = 0;
+	curl_easy_getinfo(stream->curl, CURLINFO_RESPONSE_CODE, &status);
+	int result = code == CURLE_OK ? 0 : curl_error(code);
+	if (result == 0 &&
+	    (status != 206 || !stream->response_range_valid ||
+	     stream->response_range_start != 0 ||
+	     stream->response_range_end + 1 != probe.size || probe.size == 0))
+		result = VITA_HTTPS_ERROR_RANGE_UNSUPPORTED;
+	if (result == 0) {
+		stream->size = stream->response_range_total;
 		stream->cache_start = 0;
-		stream->cache_size = result == 0 ? 1 : 0;
+		stream->cache_size = probe.size;
 	}
 	if (result < 0) {
 		range_close(stream);

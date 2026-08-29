@@ -39,9 +39,27 @@ vita_https_shutdown();
 ```
 
 `examples/get.c` includes response buffering. `vita_https_open_range_stream`
-returns a seekable 512 KiB-cached cursor after proving support with a real HTTP
-`206 Partial Content` response; its five cursor fields map directly onto the
-decoder packages' stream handle.
+returns a seekable 512 KiB-cached cursor after one real HTTP `206 Partial
+Content` request validates the server, obtains the total size, and fills the
+first cache window. The cursor retains and reuses its libcurl easy handle and
+connection cache for later range fills; failed fills invalidate the old window
+before any partially received bytes can be observed. Its five cursor fields map
+directly onto the decoder packages' stream handle.
+
+## VitaMediaDeck integration
+
+VitaMediaDeck uses the generic request API for authenticated WebDAV operations
+and the Range-stream API for media access. Independent stream handles can feed
+cover/thumbnail probing, H.264 video, the selected AAC audio track, and an
+explicitly requested embedded text-subtitle track without sharing mutable seek
+positions. Selectable-track metadata comes from the already-open video demux,
+so startup does not create another discovery cursor. The app keeps passwords
+session-only by default; thumbnail
+caches contain decoded RGB565 pixels and never serialize credentials.
+
+The package remains protocol-neutral. WebDAV XML parsing, saved-source policy,
+player resume history, and UI belong to VitaMediaDeck rather than this HTTPS
+transport layer.
 
 ## Security contract
 
@@ -77,5 +95,14 @@ Installed consumers may use `find_package(VitaHttps CONFIG REQUIRED)` and link
 `VitaHttps::VitaHttps`. The installed package carries the pinned libcurl
 archive, its license texts and corresponding upstream source; Mbed TLS,
 zlib/zstd and Vita system stubs are supplied by VitaSDK.
+
+## Related repositories
+
+| Repository | Relationship |
+| --- | --- |
+| [`VitaMediaDeck`](https://github.com/spyro-98/VitaMediaDeck) | Main local and authenticated-network media application |
+| [`vita-hw-decoder`](https://github.com/spyro-98/vita-hw-decoder) | Hardware H.264/AAC consumer of seekable stream factories |
+| [`vita-sw-decoder`](https://github.com/spyro-98/vita-sw-decoder) | CPU H.264 fallback using the same stream contract |
+| [`VitaMediaDeck-Transcoder`](https://github.com/spyro-98/VitaMediaDeck-Transcoder) | Optional desktop producer of Vita-oriented media files |
 
 Licensed GPL-3.0-only. See `THIRD_PARTY_NOTICES.md`.
