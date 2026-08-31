@@ -63,7 +63,9 @@ transport layer.
 
 ## Security contract
 
-- only `https://` input and redirect URLs are accepted;
+- `https://` is the default and HTTPS redirects can never downgrade to HTTP;
+- plain `http://` is accepted only when a caller explicitly sets `allow_http`;
+  credentials and response data are unencrypted in that mode;
 - TLS 1.2 is the minimum negotiated protocol version;
 - peer and hostname verification are enabled by default;
 - a bundled Mozilla CA store is supplied explicitly;

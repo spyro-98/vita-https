@@ -34,6 +34,9 @@ typedef struct VitaHttpsClientConfig {
 	 * unless allow_untrusted_ca_with_pin is also set. */
 	const char *pinned_public_key;
 	int allow_untrusted_ca_with_pin;
+	/* Explicit opt-in for plain HTTP endpoints. HTTPS requests still reject
+	 * redirects to HTTP, so enabling this cannot downgrade a secure URL. */
+	int allow_http;
 } VitaHttpsClientConfig;
 
 typedef size_t (*VitaHttpsWriteCallback)(const void *data, size_t size,
@@ -82,9 +85,11 @@ void vita_https_client_destroy(VitaHttpsClient *client);
 int vita_https_probe_public_key(VitaHttpsClient *client, const char *url,
 	                            char *pin, size_t pin_size);
 
-/* Only https:// URLs are accepted and redirects are restricted to HTTPS.
- * CA and host verification are mandatory by default. An explicitly confirmed
- * public-key pin may replace CA verification for a private/self-signed server. */
+/* HTTPS is required by default. A client configured with allow_http may also
+ * use http:// URLs; credentials and media are then transmitted unencrypted.
+ * HTTPS requests never follow redirects to HTTP. CA and host verification are
+ * mandatory for HTTPS by default. An explicitly confirmed public-key pin may
+ * replace CA verification for a private/self-signed server. */
 int vita_https_perform(VitaHttpsClient *client,
 	                   const VitaHttpsRequest *request,
 	                   VitaHttpsResponse *response);

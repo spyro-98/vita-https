@@ -27,6 +27,7 @@ struct VitaHttpsClient {
 	long low_speed_time;
 	char pinned_public_key[128];
 	int allow_untrusted_ca_with_pin;
+	int allow_http;
 };
 
 typedef struct RangeStream {
@@ -69,6 +70,15 @@ static int curl_error(CURLcode code) {
 
 static int valid_https_url(const char *url) {
 	return url && strncmp(url, "https://", 8) == 0 && url[8] != '\0';
+}
+
+static int valid_http_url(const char *url) {
+	return url && strncmp(url, "http://", 7) == 0 && url[7] != '\0';
+}
+
+static int valid_client_url(const VitaHttpsClient *client, const char *url) {
+	return valid_https_url(url) ||
+	       (client && client->allow_http && valid_http_url(url));
 }
 
 static size_t discard_write(char *data, size_t size, size_t count, void *opaque) {
@@ -126,15 +136,18 @@ static int progress_cancel(void *opaque, curl_off_t down_total,
 }
 
 static void apply_common(CURL *curl, const VitaHttpsClient *client,
-	                     volatile int *cancel) {
+	                     const char *url, volatile int *cancel) {
 	struct curl_blob ca = {
 		.data = (void *)ca_bundle_pem,
 		.len = ca_bundle_pem_len,
 		.flags = CURL_BLOB_NOCOPY
 	};
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, client->user_agent);
-	curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+	int plain_http = client->allow_http && valid_http_url(url);
+	curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,
+	                 plain_http ? "http,https" : "https");
+	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR,
+	                 plain_http ? "http,https" : "https");
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, client->connect_timeout_ms);
@@ -212,6 +225,7 @@ VitaHttpsClient *vita_https_client_create(const VitaHttpsClientConfig *config) {
 	client->allow_untrusted_ca_with_pin =
 		config && config->allow_untrusted_ca_with_pin &&
 		client->pinned_public_key[0];
+	client->allow_http = config && config->allow_http;
 	client->connect_timeout_ms = config && config->connect_timeout_ms > 0
 	                           ? config->connect_timeout_ms : 10000;
 	client->request_timeout_ms = config && config->request_timeout_ms > 0
@@ -272,7 +286,7 @@ int vita_https_probe_public_key(VitaHttpsClient *client, const char *url,
 	pin[0] = '\0';
 	CURL *curl = curl_easy_init();
 	if (!curl) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
-	apply_common(curl, client, NULL);
+	apply_common(curl, client, url, NULL);
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
@@ -305,11 +319,11 @@ int vita_https_perform(VitaHttpsClient *client,
 	                   const VitaHttpsRequest *request,
 	                   VitaHttpsResponse *response) {
 	if (s_init_count <= 0) return VITA_HTTPS_ERROR_NOT_INITIALIZED;
-	if (!client || !request || !valid_https_url(request->url))
+	if (!client || !request || !valid_client_url(client, request->url))
 		return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
 	CURL *curl = curl_easy_init();
 	if (!curl) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
-	apply_common(curl, client, request->cancel_flag);
+	apply_common(curl, client, request->url, request->cancel_flag);
 	curl_easy_setopt(curl, CURLOPT_URL, request->url);
 	const char *method = request->method ? request->method : "GET";
 	if (strcmp(method, "HEAD") == 0) {
@@ -457,7 +471,7 @@ static void range_close(void *opaque) {
 int vita_https_open_range_stream(VitaHttpsClient *client, const char *url,
 	                             volatile int *cancel_flag,
 	                             VitaHttpsStream *out) {
-	if (!client || !out || !valid_https_url(url))
+	if (!client || !out || !valid_client_url(client, url))
 		return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
 	RangeStream *stream = calloc(1, sizeof(*stream));
@@ -471,7 +485,7 @@ int vita_https_open_range_stream(VitaHttpsClient *client, const char *url,
 	}
 	stream->client = client;
 	stream->cancel = cancel_flag;
-	apply_common(stream->curl, client, cancel_flag);
+	apply_common(stream->curl, client, url, cancel_flag);
 	curl_easy_setopt(stream->curl, CURLOPT_URL, stream->url);
 	curl_easy_setopt(stream->curl, CURLOPT_HEADERFUNCTION, range_header);
 	curl_easy_setopt(stream->curl, CURLOPT_HEADERDATA, stream);
@@ -512,7 +526,8 @@ const char *vita_https_error_string(int error) {
 		return curl_easy_strerror((CURLcode)(VITA_HTTPS_ERROR_CURL_BASE - error));
 	switch (error) {
 	case 0: return "success";
-	case VITA_HTTPS_ERROR_INVALID_ARGUMENT: return "invalid argument or non-HTTPS URL";
+	case VITA_HTTPS_ERROR_INVALID_ARGUMENT:
+		return "invalid argument or HTTP URL not explicitly allowed";
 	case VITA_HTTPS_ERROR_NOT_INITIALIZED: return "vita_https_init was not called";
 	case VITA_HTTPS_ERROR_OUT_OF_MEMORY: return "out of memory";
 	case VITA_HTTPS_ERROR_HTTP_STATUS: return "HTTP request failed";
