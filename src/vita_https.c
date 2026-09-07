@@ -51,6 +51,12 @@ typedef struct WriteBridge {
 	void *opaque;
 } WriteBridge;
 
+typedef struct ProgressBridge {
+	volatile int *cancel;
+	VitaHttpsProgressCallback callback;
+	void *opaque;
+} ProgressBridge;
+
 typedef struct FixedBuffer {
 	unsigned char *data;
 	size_t size;
@@ -94,6 +100,38 @@ static size_t bridge_write(char *data, size_t size, size_t count, void *opaque) 
 	return bridge->callback(data, bytes, bridge->opaque);
 }
 
+typedef struct { VitaHttpsResponse *response; const VitaHttpsRequest *request; } HeaderBridge;
+static size_t response_header(char *data, size_t size, size_t count,
+	                          void *opaque) {
+	if (size && count > SIZE_MAX / size) return 0;
+	size_t bytes = size * count;
+	HeaderBridge *bridge = opaque;
+	if (bridge->request->header && bridge->request->header(data, bytes,
+	    bridge->request->header_opaque) != bytes) return 0;
+	VitaHttpsResponse *response = bridge->response;
+	if (!response || !bytes) return bytes;
+	/* A redirect starts a new header block. Only the final response's filename
+	 * may influence the caller's output path. */
+	if (bytes >= 5 && strncasecmp(data, "HTTP/", 5) == 0) {
+		response->content_disposition[0] = '\0';
+		return bytes;
+	}
+	static const char field[] = "Content-Disposition:";
+	if (bytes < sizeof(field) - 1 ||
+	    strncasecmp(data, field, sizeof(field) - 1) != 0) return bytes;
+	const char *value = data + sizeof(field) - 1;
+	const char *end = data + bytes;
+	while (value < end && (*value == ' ' || *value == '\t')) value++;
+	while (end > value && (end[-1] == '\r' || end[-1] == '\n' ||
+	                       end[-1] == ' ' || end[-1] == '\t')) end--;
+	size_t length = (size_t)(end - value);
+	if (length >= sizeof(response->content_disposition))
+		length = sizeof(response->content_disposition) - 1;
+	memcpy(response->content_disposition, value, length);
+	response->content_disposition[length] = '\0';
+	return bytes;
+}
+
 static size_t fixed_write(char *data, size_t size, size_t count, void *opaque) {
 	FixedBuffer *buffer = (FixedBuffer *)opaque;
 	size_t bytes = size * count;
@@ -133,6 +171,21 @@ static int progress_cancel(void *opaque, curl_off_t down_total,
 	(void)up_now;
 	volatile int *cancel = (volatile int *)opaque;
 	return cancel && *cancel;
+}
+
+static int progress_bridge(void *opaque, curl_off_t down_total,
+	                       curl_off_t down_now, curl_off_t up_total,
+	                       curl_off_t up_now) {
+	(void)up_total;
+	(void)up_now;
+	ProgressBridge *bridge = (ProgressBridge *)opaque;
+	if (!bridge || (bridge->cancel && *bridge->cancel)) return 1;
+	if (!bridge->callback) return 0;
+	int64_t downloaded = down_now > (curl_off_t)INT64_MAX ? INT64_MAX
+	                   : down_now > 0 ? (int64_t)down_now : 0;
+	int64_t total = down_total > (curl_off_t)INT64_MAX ? INT64_MAX
+	              : down_total > 0 ? (int64_t)down_total : 0;
+	return bridge->callback(downloaded, total, bridge->opaque) != 0;
 }
 
 static void apply_common(CURL *curl, const VitaHttpsClient *client,
@@ -323,6 +376,7 @@ int vita_https_perform(VitaHttpsClient *client,
 		return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
 	CURL *curl = curl_easy_init();
 	if (!curl) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
+	if (response) memset(response, 0, sizeof(*response));
 	apply_common(curl, client, request->url, request->cancel_flag);
 	curl_easy_setopt(curl, CURLOPT_URL, request->url);
 	const char *method = request->method ? request->method : "GET";
@@ -345,6 +399,23 @@ int vita_https_perform(VitaHttpsClient *client,
 	                 request->write ? bridge_write : discard_write);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA,
 	                 request->write ? (void *)&bridge : NULL);
+	HeaderBridge header_bridge = {response, request};
+	if (response || request->header) {
+		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, response_header);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &header_bridge);
+	}
+	ProgressBridge progress = {
+		.cancel = request->cancel_flag,
+		.callback = request->progress,
+		.opaque = request->progress_opaque
+	};
+	if (request->progress) {
+		/* Override apply_common's cancellation-only callback with one that also
+		 * publishes libcurl's live response length to the caller. */
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_bridge);
+		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&progress);
+	}
 	CURLcode code = curl_easy_perform(curl);
 	long status = 0;
 	curl_off_t length = -1;
@@ -353,7 +424,6 @@ int vita_https_perform(VitaHttpsClient *client,
 	curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length);
 	curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective);
 	if (response) {
-		memset(response, 0, sizeof(*response));
 		response->status_code = status;
 		response->content_length = (int64_t)length;
 		if (effective)

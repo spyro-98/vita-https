@@ -41,6 +41,8 @@ typedef struct VitaHttpsClientConfig {
 
 typedef size_t (*VitaHttpsWriteCallback)(const void *data, size_t size,
 	                                     void *opaque);
+typedef int (*VitaHttpsProgressCallback)(int64_t downloaded, int64_t total,
+	                                     void *opaque);
 
 typedef struct VitaHttpsRequest {
 	const char *method;
@@ -50,12 +52,21 @@ typedef struct VitaHttpsRequest {
 	size_t body_size;
 	VitaHttpsWriteCallback write;
 	void *write_opaque;
+	/* Called while the response is transferring. total is zero when the server
+	 * does not disclose a length. Returning non-zero aborts the request. */
+	VitaHttpsProgressCallback progress;
+	void *progress_opaque;
 	volatile int *cancel_flag;
+	/* Raw response header lines, including redirects; return size to continue. */
+	VitaHttpsWriteCallback header;
+	void *header_opaque;
 } VitaHttpsRequest;
 
 typedef struct VitaHttpsResponse {
 	long status_code;
 	int64_t content_length;
+	/* Raw final-response header value, without the field name or CRLF. */
+	char content_disposition[512];
 	char effective_url[2048];
 } VitaHttpsResponse;
 

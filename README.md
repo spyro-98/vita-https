@@ -38,6 +38,10 @@ vita_https_client_destroy(client);
 vita_https_shutdown();
 ```
 
+`VitaHttpsResponse` reports the final response status, effective URL, content
+length, and raw `Content-Disposition` value. Requests may also provide a live
+progress callback; its total is zero when the server does not disclose one.
+
 `examples/get.c` includes response buffering. `vita_https_open_range_stream`
 returns a seekable 512 KiB-cached cursor after one real HTTP `206 Partial
 Content` request validates the server, obtains the total size, and fills the
