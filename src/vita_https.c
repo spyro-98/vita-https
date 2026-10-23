@@ -170,7 +170,7 @@ static int progress_cancel(void *opaque, curl_off_t down_total,
 	(void)up_total;
 	(void)up_now;
 	volatile int *cancel = (volatile int *)opaque;
-	return cancel && *cancel;
+	return cancel && __atomic_load_n(cancel, __ATOMIC_ACQUIRE);
 }
 
 static int progress_bridge(void *opaque, curl_off_t down_total,
@@ -179,7 +179,8 @@ static int progress_bridge(void *opaque, curl_off_t down_total,
 	(void)up_total;
 	(void)up_now;
 	ProgressBridge *bridge = (ProgressBridge *)opaque;
-	if (!bridge || (bridge->cancel && *bridge->cancel)) return 1;
+	if (!bridge || (bridge->cancel &&
+	    __atomic_load_n(bridge->cancel, __ATOMIC_ACQUIRE))) return 1;
 	if (!bridge->callback) return 0;
 	int64_t downloaded = down_now > (curl_off_t)INT64_MAX ? INT64_MAX
 	                   : down_now > 0 ? (int64_t)down_now : 0;
@@ -368,7 +369,7 @@ int vita_https_probe_public_key(VitaHttpsClient *client, const char *url,
 	return result;
 }
 
-int vita_https_perform(VitaHttpsClient *client,
+static int perform_request(int follow_redirects, VitaHttpsClient *client,
 	                   const VitaHttpsRequest *request,
 	                   VitaHttpsResponse *response) {
 	if (s_init_count <= 0) return VITA_HTTPS_ERROR_NOT_INITIALIZED;
@@ -378,6 +379,7 @@ int vita_https_perform(VitaHttpsClient *client,
 	if (!curl) return VITA_HTTPS_ERROR_OUT_OF_MEMORY;
 	if (response) memset(response, 0, sizeof(*response));
 	apply_common(curl, client, request->url, request->cancel_flag);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, follow_redirects ? 1L : 0L);
 	curl_easy_setopt(curl, CURLOPT_URL, request->url);
 	const char *method = request->method ? request->method : "GET";
 	if (strcmp(method, "HEAD") == 0) {
@@ -608,3 +610,8 @@ const char *vita_https_error_string(int error) {
 	default: return "Vita network initialization failed";
 	}
 }
+
+int vita_https_perform(VitaHttpsClient *client, const VitaHttpsRequest *request,
+ VitaHttpsResponse *response) { return perform_request(1, client, request, response); }
+int vita_https_perform_no_redirects(VitaHttpsClient *client, const VitaHttpsRequest *request,
+ VitaHttpsResponse *response) { return perform_request(0, client, request, response); }

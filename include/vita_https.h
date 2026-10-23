@@ -56,6 +56,8 @@ typedef struct VitaHttpsRequest {
 	 * does not disclose a length. Returning non-zero aborts the request. */
 	VitaHttpsProgressCallback progress;
 	void *progress_opaque;
+	/* Flags shared across threads must use atomic reads/writes, e.g.
+	 * __atomic_store_n(flag, 1, __ATOMIC_RELEASE) to request cancellation. */
 	volatile int *cancel_flag;
 	/* Raw response header lines, including redirects; return size to continue. */
 	VitaHttpsWriteCallback header;
@@ -81,6 +83,8 @@ typedef struct VitaHttpsStream {
 } VitaHttpsStream;
 
 /* Owns sceNet/sceNetCtl and libcurl global state. Calls are reference counted. */
+int vita_https_perform_no_redirects(VitaHttpsClient *, const VitaHttpsRequest *, VitaHttpsResponse *);
+
 int vita_https_init(void);
 void vita_https_shutdown(void);
 int vita_https_is_connected(void);
