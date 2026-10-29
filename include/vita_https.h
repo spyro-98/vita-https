@@ -69,7 +69,7 @@ typedef struct VitaHttpsResponse {
 	int64_t content_length;
 	/* Raw final-response header value, without the field name or CRLF. */
 	char content_disposition[512];
-	char effective_url[2048];
+	char effective_url[4096];
 } VitaHttpsResponse;
 
 /* Same cursor shape used by vita-hw-decoder and vita-sw-decoder. An adapter
