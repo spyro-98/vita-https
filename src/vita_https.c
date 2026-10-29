@@ -63,7 +63,12 @@ typedef struct FixedBuffer {
 	size_t capacity;
 } FixedBuffer;
 
+/* Lifecycle calls are serialized by the owner. Publish the fully initialized
+ * runtime to render/status and fetch workers with acquire/release ordering. */
 static int s_init_count;
+static int runtime_ready(void) {
+	return __atomic_load_n(&s_init_count, __ATOMIC_ACQUIRE) > 0;
+}
 
 static int curl_error(CURLcode code) {
 	if (code == CURLE_PEER_FAILED_VERIFICATION ||
@@ -231,8 +236,8 @@ static void apply_common(CURL *curl, const VitaHttpsClient *client,
 }
 
 int vita_https_init(void) {
-	if (s_init_count > 0) {
-		s_init_count++;
+	if (runtime_ready()) {
+		__atomic_add_fetch(&s_init_count, 1, __ATOMIC_RELEASE);
 		return 0;
 	}
 	int result = vita_https_net_init();
@@ -242,28 +247,28 @@ int vita_https_init(void) {
 		vita_https_net_term();
 		return curl_error(code);
 	}
-	s_init_count = 1;
+	__atomic_store_n(&s_init_count, 1, __ATOMIC_RELEASE);
 	return 0;
 }
 
 void vita_https_shutdown(void) {
-	if (s_init_count <= 0 || --s_init_count > 0) return;
+	if (!runtime_ready() || __atomic_sub_fetch(&s_init_count, 1, __ATOMIC_ACQ_REL) > 0) return;
 	curl_global_cleanup();
 	vita_https_net_term();
 }
 
 int vita_https_is_connected(void) {
-	return s_init_count > 0 && vita_https_net_is_connected();
+	return runtime_ready() && vita_https_net_is_connected();
 }
 
 int vita_https_wifi_signal_percent(int *percent) {
-	return s_init_count > 0
+	return runtime_ready()
 	     ? vita_https_net_wifi_signal_percent(percent)
 	     : VITA_HTTPS_ERROR_NOT_INITIALIZED;
 }
 
 VitaHttpsClient *vita_https_client_create(const VitaHttpsClientConfig *config) {
-	if (s_init_count <= 0) return NULL;
+	if (!runtime_ready()) return NULL;
 	VitaHttpsClient *client = calloc(1, sizeof(*client));
 	if (!client) return NULL;
 	snprintf(client->user_agent, sizeof(client->user_agent), "%s",
@@ -334,7 +339,7 @@ static int public_key_pin_from_pem(const char *pem, char *pin,
 
 int vita_https_probe_public_key(VitaHttpsClient *client, const char *url,
 	                            char *pin, size_t pin_size) {
-	if (s_init_count <= 0) return VITA_HTTPS_ERROR_NOT_INITIALIZED;
+	if (!runtime_ready()) return VITA_HTTPS_ERROR_NOT_INITIALIZED;
 	if (!client || !valid_https_url(url) || !pin || pin_size < 53)
 		return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
 	pin[0] = '\0';
@@ -372,7 +377,7 @@ int vita_https_probe_public_key(VitaHttpsClient *client, const char *url,
 static int perform_request(int follow_redirects, VitaHttpsClient *client,
 	                   const VitaHttpsRequest *request,
 	                   VitaHttpsResponse *response) {
-	if (s_init_count <= 0) return VITA_HTTPS_ERROR_NOT_INITIALIZED;
+	if (!runtime_ready()) return VITA_HTTPS_ERROR_NOT_INITIALIZED;
 	if (!client || !request || !valid_client_url(client, request->url))
 		return VITA_HTTPS_ERROR_INVALID_ARGUMENT;
 	CURL *curl = curl_easy_init();
@@ -439,7 +444,7 @@ static int perform_request(int follow_redirects, VitaHttpsClient *client,
 }
 
 char *vita_https_escape(const char *text, size_t length) {
-	if (s_init_count <= 0 || !text || length > INT_MAX) return NULL;
+	if (!runtime_ready() || !text || length > INT_MAX) return NULL;
 	CURL *curl = curl_easy_init();
 	if (!curl) return NULL;
 	char *escaped = curl_easy_escape(curl, text, (int)length);
@@ -448,7 +453,7 @@ char *vita_https_escape(const char *text, size_t length) {
 }
 
 char *vita_https_unescape(const char *text, size_t *length) {
-	if (s_init_count <= 0 || !text) return NULL;
+	if (!runtime_ready() || !text) return NULL;
 	CURL *curl = curl_easy_init();
 	if (!curl) return NULL;
 	int decoded_length = 0;

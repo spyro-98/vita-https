@@ -14,5 +14,10 @@ for vita_https_sanitizer in address,undefined thread; do
         -Iinclude "-I$vita_https_output/include" tests/cancel_test.c \
         -Wl,-dead_strip -lpthread -o "$vita_https_output/cancel-test"
     "$vita_https_output/cancel-test"
+    clang -O1 -g -Wall -Wextra -Wno-deprecated-declarations \
+        "-fsanitize=$vita_https_sanitizer" -ffunction-sections -fdata-sections \
+        -Iinclude "-I$vita_https_output/include" tests/startup_publication_test.c \
+        -Wl,-dead_strip -lpthread -o "$vita_https_output/startup-test"
+    "$vita_https_output/startup-test"
 done
 printf 'HTTPS cancellation host artifacts: %s\n' "$vita_https_output"
